@@ -1,0 +1,214 @@
+<?php
+
+/*
+ * This file is part of fof/byobu.
+ *
+ * Copyright (c) FriendsOfFlarum.
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace FoF\Byobu\Listeners;
+
+use Carbon\Carbon;
+use Flarum\Discussion\Discussion;
+use Flarum\Discussion\Event\Saving;
+use Flarum\User\Exception\PermissionDeniedException;
+use Flarum\User\User;
+use FoF\Byobu\Concerns\ExtensionsDiscovery;
+use FoF\Byobu\Discussion\Screener;
+use FoF\Byobu\Events;
+use FoF\Byobu\Events\AllRecipientsLeft;
+use Illuminate\Contracts\Events\Dispatcher;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Str;
+
+class PersistRecipients
+{
+    use ExtensionsDiscovery;
+
+    /**
+     * @var Screener
+     */
+    protected $screener;
+
+    public function __construct(protected Dispatcher $events)
+    {
+    }
+
+    public function handle(Saving $event): void
+    {
+        if (!$this->eventSubmitsRelationships($event->data)) {
+            return;
+        }
+
+        /** @var Screener $screener */
+        $screener = resolve('byobu.screener');
+        $this->screener = $screener->whenSavingDiscussions($event);
+
+        if ($this->screener->nothingChanged()) {
+            return;
+        }
+
+        if ($event->actor->cannot('discussion.startPrivateDiscussionWithBlockers') && $this->screener->hasBlockingUsers()) {
+            throw new PermissionDeniedException('Not allowed to add users that blocked receiving private discussions');
+        }
+
+        if ($event->actor->cannot('transformToPublic', $event->discussion) && $this->screener->makingPublic()) {
+            throw new PermissionDeniedException('Not allowed to convert to a public discussion');
+        }
+
+        if (!$event->discussion->exists) {
+            $this->checkPermissionsForNewDiscussion($event->actor);
+            $event->discussion->isByobu = true;
+
+            // Ensure the actor is always included as a user recipient (issue #168).
+            // Must happen before the addMoreThanTwoUserRecipients check so that
+            // the limit is evaluated against the true final recipient count.
+            if ($this->screener->isPrivate() && !$this->screener->users->contains($event->actor)) {
+                $this->screener->users = $this->screener->users->concat([$event->actor]);
+            }
+        } else {
+            $this->checkPermissionsForExistingDiscussion($event->actor, $event->discussion);
+        }
+
+        if ($event->actor->cannot('addMoreThanTwoUserRecipients', $event->discussion) && $this->screener->users->count() > 2) {
+            throw new PermissionDeniedException('Not allowed to add more than 2 user recipients');
+        }
+
+        // Set is_private immediately on new discussions so the first INSERT writes
+        // is_private=1, closing the race window where the discussion is briefly
+        // visible to non-recipients (issue #239).
+        //
+        // Also pre-populate the relation cache on this $discussion object so all
+        // subsequent saves on the same stale instance (e.g. the final save in
+        // StartDiscussionHandler) also see non-empty recipients and keep is_private=1
+        // rather than resetting it to 0.
+        if (!$event->discussion->exists && $this->screener->isPrivate()) {
+            $event->discussion->is_private = true;
+            $event->discussion->setRelation('recipientUsers', $this->screener->users);
+            $event->discussion->setRelation('recipientGroups', $this->screener->groups);
+        }
+
+        // When discussions need approval and this is a private disucussion, ignore approvals.
+        if ($this->screener->isPrivate() && $this->extensionIsEnabled('flarum-approval')) {
+            /** @phpstan-ignore-next-line */
+            $event->discussion->is_approved = true;
+        }
+
+        $allRecipientsLeftAndHidden = false;
+
+        // Private discussions that used to be private but no longer have any recipients
+        // now by default will be soft deleted/hidden.
+        // The Deleting event is dispatched, if a listener interferes by returning
+        // a non-null response the discussion will not be soft deleted.
+        if ($this->screener->wasPrivate() && !$this->screener->isPrivate() && !$this->screener->makingPublic()) {
+            $eventArgs = $this->eventArguments($event->discussion);
+
+            if ($this->events->until(new Events\Deleting(...$eventArgs)) === null) {
+                $event->discussion->hide($event->actor);
+                $allRecipientsLeftAndHidden = true;
+            }
+        }
+
+        $this->raiseEvent($event->discussion);
+
+        Discussion::saving(function (Discussion $discussion) {
+            $discussion->offsetUnset('isByobu');
+        });
+
+        $event->discussion->afterSave(function (Discussion $discussion) {
+            foreach (['users', 'groups'] as $type) {
+                $relation = 'recipient'.Str::ucfirst($type);
+
+                // Add models that weren't stored yet.
+                $discussion->{$relation}()->saveMany(
+                    $this->screener->added($type),
+                    ['removed_at' => null]
+                );
+
+                $this->screener->deleted($type)->each(function ($model) use ($discussion, $relation) {
+                    $discussion->{$relation}()->updateExistingPivot(
+                        $model,
+                        ['removed_at' => Carbon::now()]
+                    );
+                });
+            }
+
+            // Read afresh whether the discussion is still private.
+            $discussion->unsetRelation('activeRecipients');
+        });
+
+        if ($allRecipientsLeftAndHidden) {
+            $event->discussion->afterSave(function (Discussion $discussion) use ($event) {
+                $this->events->dispatch(new AllRecipientsLeft($discussion, $event->actor));
+            });
+        }
+    }
+
+    protected function eventArguments(Discussion $discussion): array
+    {
+        return [
+            $discussion,
+            $this->screener,
+            $this->screener->actor(),
+        ];
+    }
+
+    protected function raiseEvent(Discussion $discussion): void
+    {
+        $args = $this->eventArguments($discussion);
+
+        if ($this->screener->isPrivate() && !$discussion->exists) {
+            $event = new Events\Created(...$args);
+        } elseif ($this->screener->makingPublic()) {
+            $event = new Events\DiscussionMadePublic(...$args);
+        } elseif ($this->screener->actorRemoved()) {
+            $event = new Events\RemovedSelf(...$args);
+        } else {
+            $event = new Events\RecipientsChanged(...$args);
+        }
+
+        $discussion->raise($event);
+    }
+
+    protected function checkPermissionsForNewDiscussion(User $user): void
+    {
+        if ($this->screener->users->isNotEmpty() && $user->cannot('discussion.startPrivateDiscussionWithUsers')) {
+            throw new PermissionDeniedException('Not allowed to add users to a private discussion');
+        }
+        if ($this->screener->groups->isNotEmpty() && $user->cannot('discussion.startPrivateDiscussionWithGroups')) {
+            throw new PermissionDeniedException('Not allowed to add groups to a private discussion');
+        }
+    }
+
+    protected function checkPermissionsForExistingDiscussion(User $user, Discussion $discussion): void
+    {
+        // Actor should always be able to remove themself.
+        if ($this->screener->onlyActorRemoved()) {
+            return;
+        }
+
+        // What the actor sent: recipients kept because they can't see them aren't theirs to change.
+        if ($this->screener->sentUsers->isNotEmpty() && $user->cannot('discussion.editUserRecipients', $discussion)) {
+            throw new PermissionDeniedException('Not allowed to change users in a private discussion');
+        }
+        if ($this->screener->sentGroups->isNotEmpty() && $user->cannot('discussion.editGroupRecipients')) {
+            throw new PermissionDeniedException('Not allowed to change groups in a private discussion');
+        }
+    }
+
+    protected function eventSubmitsRelationships(array $data): bool
+    {
+        $valid = false;
+
+        foreach (['users', 'groups'] as $type) {
+            $relation = Screener::relationName($type);
+
+            $valid = $valid || Arr::has($data, "relationships.$relation");
+        }
+
+        return $valid;
+    }
+}

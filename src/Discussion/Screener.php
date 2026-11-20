@@ -1,0 +1,247 @@
+<?php
+
+/*
+ * This file is part of fof/byobu.
+ *
+ * Copyright (c) FriendsOfFlarum.
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace FoF\Byobu\Discussion;
+
+use Flarum\Discussion\Discussion;
+use Flarum\Discussion\Event\Saving;
+use Flarum\Group\Group;
+use Flarum\User\User;
+use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Fluent;
+use Illuminate\Support\Str;
+
+/**
+ * @property Saving|null        $event
+ * @property Collection|User[]  $currentUsers
+ * @property Collection|Group[] $currentGroups
+ * @property Collection|User[]  $users         The recipients once saved.
+ * @property Collection|Group[] $groups        The recipients once saved.
+ * @property Collection|User[]  $sentUsers     The recipients the actor sent.
+ * @property Collection|Group[] $sentGroups    The recipients the actor sent.
+ */
+class Screener extends Fluent
+{
+    public function fromDiscussion(Discussion $discussion): Screener
+    {
+        $screener = new self();
+
+        /** @phpstan-ignore-next-line */
+        $screener->users = $screener->currentUsers = $discussion->recipientUsers;
+        /** @phpstan-ignore-next-line */
+        $screener->groups = $screener->currentGroups = $discussion->recipientGroups;
+
+        return $screener;
+    }
+
+    /**
+     * Whether the discussion is a byobu private discussion, without loading
+     * its recipients when it can't be one.
+     *
+     * is_private alone doesn't identify one: flarum/approval and others set it
+     * too. But GetModelIsPrivate sets it on every save of a discussion that has
+     * recipients, so a stored discussion that isn't private has none. Policies
+     * and serialised fields ask this of every discussion in a response,
+     * including those reached through another resource's include, which aren't
+     * eager loaded with their recipients.
+     *
+     * Not for computing is_private itself: that's GetModelIsPrivate.
+     */
+    public function isPrivateDiscussion(Discussion $discussion): bool
+    {
+        if (!$discussion->exists) {
+            return $this->fromDiscussion($discussion)->isPrivate();
+        }
+
+        // Strictly false: a discussion loaded without the column is checked
+        // by its recipients.
+        if ($discussion->is_private === false) {
+            return false;
+        }
+
+        // Not recipientUsers and recipientGroups: the API loads those scoped
+        // to what the actor may see, so a hidden recipient group is missing.
+        /** @phpstan-ignore-next-line */
+        return $discussion->activeRecipients->isNotEmpty();
+    }
+
+    public function whenSavingDiscussions(Saving $event): Screener
+    {
+        $screener = new self();
+        /** @phpstan-ignore-next-line */
+        $screener->currentUsers = $event->discussion->recipientUsers;
+        /** @phpstan-ignore-next-line */
+        $screener->currentGroups = $event->discussion->recipientGroups;
+
+        $screener->event = $event;
+
+        $screener->sentUsers = $screener->users = static::getRecipientsFromPayload($event, 'users');
+        $screener->sentGroups = $screener->groups = static::getRecipientsFromPayload($event, 'groups');
+
+        // The API never shows an actor the recipients they may not see (hidden
+        // groups), so their absence from what the actor sends back doesn't
+        // remove them. Making the discussion public removes everyone.
+        if (!$screener->makingPublic()) {
+            $screener->users = $screener->users->merge(static::unseen($screener->currentUsers, $event->actor));
+            $screener->groups = $screener->groups->merge(static::unseen($screener->currentGroups, $event->actor));
+        }
+
+        return $screener;
+    }
+
+    /**
+     * @param Collection<int, User|Group> $recipients
+     *
+     * @return Collection<int, User|Group>
+     */
+    protected static function unseen(Collection $recipients, User $actor): Collection
+    {
+        if ($recipients->isEmpty()) {
+            return $recipients;
+        }
+
+        $model = $recipients->first();
+
+        $seen = $model->newQuery()
+            ->whereVisibleTo($actor)
+            ->whereKey($recipients->modelKeys())
+            ->pluck($model->getKeyName())
+            ->all();
+
+        return $recipients->reject(fn ($recipient) => in_array($recipient->getKey(), $seen));
+    }
+
+    public function actor(): ?User
+    {
+        return $this->event->actor ?? null;
+    }
+
+    public function nothingChanged(): bool
+    {
+        $nothingChanged = true;
+
+        foreach (['users', 'groups'] as $type) {
+            foreach (['added', 'deleted'] as $action) {
+                if ($this->{$action}($type)->isNotEmpty()) {
+                    return false;
+                }
+            }
+        }
+
+        return $nothingChanged;
+    }
+
+    public function isPrivate(): bool
+    {
+        return $this->users->isNotEmpty() || $this->groups->isNotEmpty();
+    }
+
+    public function wasPrivate(): bool
+    {
+        return $this->currentUsers->isNotEmpty() || $this->currentGroups->isNotEmpty();
+    }
+
+    protected function getRecipientsFromPayload(Saving $event, string $type): Collection
+    {
+        $data = Arr::get(
+            $event->data,
+            'relationships.'.static::relationName($type).'.data',
+            []
+        );
+
+        /** @phpstan-ignore-next-line */
+        $ids = collect($data)->pluck('id');
+
+        if ($type === 'groups') {
+            return Group::query()->whereIn('id', $ids)->get();
+        }
+
+        return User::query()->whereIn('id', $ids)->get();
+    }
+
+    final public static function relationName(string $type): string
+    {
+        return 'recipient'.Str::ucfirst($type);
+    }
+
+    public function hasBlockingUsers(): bool
+    {
+        return $this->users
+            ->reject(function (User $user) {
+                // Reject currentUsers and allow the actor to create PDs even if they block incoming new PDs
+                return $this->currentUsers->contains($user) || ($user->id === $this->actor()?->id);
+            })
+            ->first(function (User $user) {
+                return boolval($user->blocks_byobu_pd);
+            }) !== null;
+    }
+
+    public function deleted(string $type): Collection
+    {
+        if ($type === 'groups') {
+            return $this->currentGroups->diff($this->groups);
+        }
+
+        return $this->currentUsers->diff($this->users);
+    }
+
+    public function added(string $type): Collection
+    {
+        if ($type === 'groups') {
+            return $this->groups->diff($this->currentGroups);
+        }
+
+        return $this->users->diff($this->currentUsers);
+    }
+
+    public function actorRemoved(): bool
+    {
+        return $this->deleted('users')->find($this->actor()) !== null;
+    }
+
+    public function onlyActorRemoved(): bool
+    {
+        // Actor hasn't been removed.
+        if (!$this->actorRemoved()) {
+            return false;
+        }
+        // More than just the actor removed.
+        if ($this->deleted('users')->count() > 1) {
+            return false;
+        }
+        // Users were added.
+        if ($this->added('users')->count() > 0) {
+            return false;
+        }
+        // Groups were removed.
+        if ($this->deleted('groups')->count() > 0) {
+            return false;
+        }
+        // Groups were added.
+        if ($this->added('groups')->count() > 0) {
+            return false;
+        }
+
+        return true;
+    }
+
+    public function makingPublic(): bool
+    {
+        $id = Arr::get($this->event->data, 'attributes.public');
+
+        if ($id && (int) $id === $this->event->discussion->id) {
+            return true;
+        }
+
+        return false;
+    }
+}
