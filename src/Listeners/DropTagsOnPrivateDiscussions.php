@@ -1,0 +1,36 @@
+<?php
+
+/*
+ * This file is part of fof/byobu.
+ *
+ * Copyright (c) FriendsOfFlarum.
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace FoF\Byobu\Listeners;
+
+use Flarum\Discussion\Event\Saving;
+use Flarum\Extension\ExtensionManager;
+use Illuminate\Support\Arr;
+
+class DropTagsOnPrivateDiscussions
+{
+    public function __construct(protected ExtensionManager $extensions)
+    {
+    }
+
+    public function handle(Saving $event): void
+    {
+        $isByobu = Arr::has($event->data, 'relationships.recipientUsers') || Arr::has($event->data, 'relationships.recipientGroups');
+        $hasTags = Arr::has($event->data, 'relationships.tags.data');
+
+        if ($isByobu
+            && $hasTags
+            && $this->extensions->isEnabled('flarum-tags')
+        ) {
+            Arr::forget($event->data, 'relationships.tags');
+        }
+    }
+}

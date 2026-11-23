@@ -1,0 +1,90 @@
+<?php
+
+/*
+ * This file is part of fof/byobu.
+ *
+ * Copyright (c) FriendsOfFlarum.
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace FoF\Byobu\Notifications;
+
+use Flarum\Discussion\Discussion;
+use Flarum\Notification\AlertableInterface;
+use Flarum\Notification\Blueprint\BlueprintInterface;
+use Flarum\Notification\MailableInterface;
+use Flarum\User\User;
+
+class DiscussionCreatedBlueprint implements BlueprintInterface, MailableInterface, AlertableInterface
+{
+    protected User $sender;
+
+    public function __construct(public Discussion $discussion)
+    {
+    }
+
+    public function getFromUser(): ?\Flarum\User\User
+    {
+        return $this->discussion->user;
+    }
+
+    public function getSubject(): ?\Flarum\Database\AbstractModel
+    {
+        return $this->discussion;
+    }
+
+    /**
+     * Get the data to be stored in the notification.
+     *
+     * @return array|null
+     */
+    public function getData(): mixed
+    {
+        return [];
+    }
+
+    /**
+     * Get the serialized type of this activity.
+     *
+     * @return string
+     */
+    public static function getType(): string
+    {
+        return 'byobuPrivateDiscussionCreated';
+    }
+
+    /**
+     * Get the name of the model class for the subject of this activity.
+     *
+     * @return string
+     */
+    public static function getSubjectModel(): string
+    {
+        return Discussion::class;
+    }
+
+    /**
+     * Get the name of the view to construct a notification email with.
+     *
+     * @return array
+     */
+    public function getEmailViews(): array
+    {
+        return ['text' => 'fof-byobu::email.plain.privateDiscussionCreated', 'html' => 'fof-byobu::email.html.privateDiscussionCreated'];
+    }
+
+    /**
+     * Get the subject line for a notification email.
+     *
+     * @return string
+     */
+    public function getEmailSubject(\Flarum\Locale\TranslatorInterface $translator): string
+    {
+        return $translator->trans('fof-byobu.email.subject.private_discussion_created', [
+            '{display_name}'       => $this->discussion->user->display_name,
+            '{title}'              => $this->discussion->title,
+        ]);
+    }
+}
